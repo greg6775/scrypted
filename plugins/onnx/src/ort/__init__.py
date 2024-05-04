@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Tuple
+from typing import Any, List, Tuple
 
 import sys
 import platform
@@ -49,7 +49,7 @@ class ONNXPlugin(
         if model == "Default" or model not in availableModels:
             if model != "Default":
                 self.storage.setItem("model", "Default")
-            model = "scrypted_yolov8n_320"
+            model = "scrypted_yolotest_320"
         self.yolo = "yolo" in model
         self.scrypted_yolo = "scrypted_yolo" in model
         self.scrypted_model = "scrypted" in model
@@ -58,7 +58,7 @@ class ONNXPlugin(
 
         onnxmodel = "best" if self.scrypted_model else model
 
-        model_version = "v2"
+        model_version = "v5"
         onnxfile = self.downloadFile(
             f"https://raw.githubusercontent.com/koush/onnx-models/main/{model}/{onnxmodel}.onnx",
             f"{model_version}/{model}/{onnxmodel}.onnx",
@@ -115,24 +115,30 @@ class ONNXPlugin(
 
     def get_input_size(self) -> Tuple[int, int]:
         return [self.model_dim, self.model_dim]
+    
+    async def detect_batch(self, inputs: List[Any]) -> List[Any]:
+        def predict():
+            im = np.stack(inputs)
+            im = im.transpose((0, 3, 1, 2))  # BHWC to BCHW, (n, 3, h, w)
+            im = im.astype(np.float32) / 255.0
+            im = np.ascontiguousarray(im)  # contiguous
+            input_tensor = im
+
+            output_tensors = self.compiled_model.run(None, { self.input_name: input_tensor })
+            return output_tensors
+
+        output_tensors = await asyncio.get_event_loop().run_in_executor(
+            predictExecutor, lambda: predict()
+        )
+        return output_tensors[0]
 
     async def detect_once(self, input: Image.Image, settings: Any, src_size, cvss):
-        def predict(input_tensor):
-            output_tensors = self.compiled_model.run(None, { self.input_name: input_tensor })
-            objs = yolo.parse_yolov9(output_tensors[0][0])
-            return objs
-
-        im = np.array(input)
-        im = np.stack([input])
-        im = im.transpose((0, 3, 1, 2))  # BHWC to BCHW, (n, 3, h, w)
-        im = im.astype(np.float32) / 255.0
-        im = np.ascontiguousarray(im)  # contiguous
-        input_tensor = im
+        # move this to predict
+        input_tensor = np.array(input)
 
         try:
-            objs = await asyncio.get_event_loop().run_in_executor(
-                predictExecutor, lambda: predict(input_tensor)
-            )
+            output_tensors = await self.queue_batch(input_tensor)
+            objs = yolo.parse_yolov9(output_tensors)
 
         except:
             import traceback
