@@ -77,10 +77,18 @@ export function setDefaultHttpFetchAccept(headers: Headers, responseType: HttpFe
     if (headers.has('Accept'))
         return;
     const accept = getHttpFetchAccept(responseType);
-    if (accept)
+    if (accept) {
         headers.set('Accept', accept);
+        return accept;
+    }
 }
 
+/**
+ *
+ * @param headers
+ * @param body
+ * @returns Returns the body and Content-Type header that was set.
+ */
 export function createStringOrBufferBody(headers: Headers, body: any) {
     let contentType: string;
     if (typeof body === 'object') {
@@ -93,8 +101,13 @@ export function createStringOrBufferBody(headers: Headers, body: any) {
 
     if (!headers.has('Content-Type'))
         headers.set('Content-Type', contentType);
+    else
+        contentType = undefined;
 
-    return body;
+    return {
+        body,
+        contentType,
+    };
 }
 
 export async function domFetchParseIncomingMessage(response: Response, responseType: HttpFetchResponseType) {
@@ -121,7 +134,8 @@ export async function domFetch<T extends HttpFetchOptions<BodyInit>>(options: T)
 
     let { body } = options;
     if (body && !(body instanceof ReadableStream)) {
-        body = createStringOrBufferBody(headers, body);
+        const httpBody = createStringOrBufferBody(headers, body);
+        body = httpBody.body;
     }
 
     let controller: AbortController;

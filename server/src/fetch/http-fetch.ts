@@ -57,6 +57,47 @@ export function httpFetchParseIncomingMessage(readable: IncomingMessage, respons
     return getHttpFetchParser(responseType).parse(readable);
 }
 
+function createNodeHeaders(headers: HeadersInit): Record<string, string[]> {
+    const nodeHeaders: Record<string, string[]> = {};
+    if (!headers)
+        return nodeHeaders;
+    if (headers instanceof Headers) {
+        for (const [k, v] of new Headers(headers)) {
+            if (nodeHeaders[k]) {
+                nodeHeaders[k].push(v);
+            }
+            else {
+                nodeHeaders[k] = [v];
+            }
+        }
+        return nodeHeaders;
+    }
+
+    if (headers instanceof Array) {
+        for (const [k, v] of headers) {
+            if (nodeHeaders[k]) {
+                nodeHeaders[k].push(v);
+            }
+            else {
+                nodeHeaders[k] = [v];
+            }
+        }
+        return nodeHeaders;
+    }
+
+    for (const k of Object.keys(headers)) {
+        const v = headers[k];
+        if (nodeHeaders[k]) {
+            nodeHeaders[k].push(v);
+        }
+        else {
+            nodeHeaders[k] = [v];
+        }
+    }
+
+    return nodeHeaders;
+}
+
 export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T): Promise<HttpFetchResponse<
     // first one serves as default.
     T extends HttpFetchBufferOptions<Readable> ? Buffer
@@ -64,8 +105,14 @@ export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T
     : T extends HttpFetchReadableOptions<Readable> ? IncomingMessage
     : T extends HttpFetchJsonOptions<Readable> ? any : Buffer
 >> {
-    const headers = new Headers(options.headers);
-    setDefaultHttpFetchAccept(headers, options.responseType);
+    const _headers = new Headers(options.headers);
+    const accept = setDefaultHttpFetchAccept(_headers, options.responseType);
+    const nodeHeaders = createNodeHeaders(options.headers);
+    if (accept) {
+        const existingAcceptHeader = Object.keys(nodeHeaders).find(k => k.toLowerCase() === 'accept');
+        delete nodeHeaders[existingAcceptHeader];
+        nodeHeaders.Accept = [accept];
+    }
 
     const { once } = require('events') as typeof events;
     const { PassThrough, Readable } = require('stream') as typeof stream;
@@ -78,19 +125,12 @@ export async function httpFetch<T extends HttpFetchOptions<Readable>>(options: T
     let { body } = options;
     if (body && !(body instanceof Readable)) {
         const newBody = new PassThrough();
-        newBody.write(Buffer.from(createStringOrBufferBody(headers, body)));
+        const httpBody = createStringOrBufferBody(_headers, body);
+        if (httpBody.contentType)
+            nodeHeaders['Content-Type'] = [httpBody.contentType];
+        newBody.write(Buffer.from(httpBody.body));
         newBody.end();
         body = newBody;
-    }
-
-    const nodeHeaders: Record<string, string[]> = {};
-    for (const [k, v] of headers) {
-        if (nodeHeaders[k]) {
-            nodeHeaders[k].push(v);
-        }
-        else {
-            nodeHeaders[k] = [v];
-        }
     }
 
     let controller: AbortController;
