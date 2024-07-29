@@ -1,5 +1,6 @@
 export interface ClusterObject {
     id: string;
+    address: string;
     port: number;
     proxyId: string;
     sourcePort: number;

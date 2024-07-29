@@ -96,6 +96,8 @@ export function startPluginRemote(mainFilename: string, pluginId: string, peerSe
             const { clusterId, clusterSecret, zipHash } = zipOptions;
             const { zipFile, unzippedPath } = await prepareZip(getPluginVolume(pluginId), zipHash, getZip);
 
+            const SCRYPTED_CLUSTER_ADDRESS = process.env.SCRYPTED_CLUSTER_ADDRESS;
+
             const onProxySerialization = (value: any, proxyId: string, sourcePeerPort?: number) => {
                 const properties = RpcPeer.prepareProxyProperties(value) || {};
                 let clusterEntry: ClusterObject = properties.__cluster;
@@ -104,6 +106,7 @@ export function startPluginRemote(mainFilename: string, pluginId: string, peerSe
                 if (!clusterEntry) {
                     clusterEntry = {
                         id: clusterId,
+                        address: SCRYPTED_CLUSTER_ADDRESS,
                         port: clusterPort,
                         proxyId,
                         sourcePort: sourcePeerPort,
@@ -121,8 +124,10 @@ export function startPluginRemote(mainFilename: string, pluginId: string, peerSe
             }
             peer.onProxySerialization = onProxySerialization;
 
-            const resolveObject = async (id: string, sourcePeerPort: number) => {
-                const sourcePeer = sourcePeerPort ? await clusterPeers.get(sourcePeerPort) : peer;
+            const resolveObject = async (id: string, sourcePeerAddress: string, sourcePeerPort: number) => {
+                const sourcePeer = sourcePeerPort
+                    ? await clusterPeers.get(getClusterPeerKey(sourcePeerAddress, sourcePeerPort))
+                    : peer;
                 return sourcePeer?.localProxyMap.get(id);
             }
 
@@ -130,33 +135,44 @@ export function startPluginRemote(mainFilename: string, pluginId: string, peerSe
             // on the cluster server that is listening on the actual port/
             // incoming connections: use the remote random/unique port
             // outgoing connections: use the local random/unique port
-            const clusterPeers = new Map<number, Promise<RpcPeer>>();
+            const clusterPeers = new Map<string, Promise<RpcPeer>>();
+            function getClusterPeerKey(address: string, port: number) {
+                address ||= '127.0.0.1';
+                return `${address}:${port}`;
+            }
+
             const clusterRpcServer = net.createServer(client => {
                 const clusterPeer = createDuplexRpcPeer(peer.selfName, 'cluster-client', client, client);
                 const clusterPeerPort = client.remotePort;
+                const clusterPeerKey = getClusterPeerKey(client.remoteAddress, clusterPeerPort);
                 clusterPeer.onProxySerialization = (value, proxyId) => onProxySerialization(value, proxyId, clusterPeerPort);
-                clusterPeers.set(clusterPeerPort, Promise.resolve(clusterPeer));
+                clusterPeers.set(clusterPeerKey, Promise.resolve(clusterPeer));
                 startPluginRemoteOptions?.onClusterPeer?.(clusterPeer);
                 const connectRPCObject: ConnectRPCObject = async (o) => {
                     const sha256 = computeClusterObjectHash(o, clusterSecret);
                     if (sha256 !== o.sha256)
                         throw new Error('secret incorrect');
-                    return resolveObject(o.proxyId, o.sourcePort);
+                    return resolveObject(o.proxyId, o.address, o.sourcePort);
                 }
                 clusterPeer.params['connectRPCObject'] = connectRPCObject;
                 client.on('close', () => {
-                    clusterPeers.delete(clusterPeerPort);
+                    clusterPeers.delete(clusterPeerKey);
                     clusterPeer.kill('cluster socket closed');
                 });
-            })
-            const clusterPort = await listenZero(clusterRpcServer, '127.0.0.1');
+            });
 
-            const ensureClusterPeer = (connectPort: number) => {
-                let clusterPeerPromise = clusterPeers.get(connectPort);
+            const listenAddress = SCRYPTED_CLUSTER_ADDRESS
+                ? '0.0.0.0'
+                : '127.0.0.1';
+            const clusterPort = await listenZero(clusterRpcServer, listenAddress);
+
+            const ensureClusterPeer = (address: string, connectPort: number) => {
+                const clusterPeerKey = getClusterPeerKey(address, connectPort);
+                let clusterPeerPromise = clusterPeers.get(clusterPeerKey);
                 if (!clusterPeerPromise) {
                     clusterPeerPromise = (async () => {
-                        const socket = net.connect(connectPort, '127.0.0.1');
-                        socket.on('close', () => clusterPeers.delete(connectPort));
+                        const socket = net.connect(connectPort, address || '127.0.0.1');
+                        socket.on('close', () => clusterPeers.delete(clusterPeerKey));
 
                         try {
                             await once(socket, 'connect');
@@ -175,7 +191,7 @@ export function startPluginRemote(mainFilename: string, pluginId: string, peerSe
                             throw e;
                         }
                     })();
-                    clusterPeers.set(connectPort, clusterPeerPromise);
+                    clusterPeers.set(clusterPeerKey, clusterPeerPromise);
                 }
                 return clusterPeerPromise;
             };
@@ -184,18 +200,19 @@ export function startPluginRemote(mainFilename: string, pluginId: string, peerSe
                 const clusterObject: ClusterObject = value?.__cluster;
                 if (clusterObject?.id !== clusterId)
                     return value;
-                const { port, proxyId, sourcePort } = clusterObject;
+                const { address, port, proxyId, sourcePort } = clusterObject;
+
                 // handle the case when trying to connect to an object is on this cluster node,
                 // returning the actual object, rather than initiating a loopback connection.
-                if (port === clusterPort)
-                    return resolveObject(proxyId, sourcePort);
+                if (address === SCRYPTED_CLUSTER_ADDRESS && port === clusterPort)
+                    return resolveObject(proxyId, address, sourcePort);
 
                 try {
-                    const clusterPeerPromise = ensureClusterPeer(port);
+                    const clusterPeerPromise = ensureClusterPeer(address, port);
                     const clusterPeer = await clusterPeerPromise;
                     // if the localPort is the sourcePort, that means the rpc object already exists as it originated from this node.
                     // so return the existing proxy.
-                    if (clusterPeer.tags.localPort === sourcePort)
+                    if (address === SCRYPTED_CLUSTER_ADDRESS && clusterPeer.tags.localPort === sourcePort)
                         return value;
                     let peerConnectRPCObject: ConnectRPCObject = clusterPeer.tags['connectRPCObject'];
                     if (!peerConnectRPCObject) {

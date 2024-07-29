@@ -41,6 +41,7 @@ wheel
 
 class ClusterObject(TypedDict):
     id: str
+    address: str
     port: int
     proxyId: str
     sourcePort: int
@@ -408,10 +409,11 @@ class PluginRemote:
 
         clusterId = options['clusterId']
         clusterSecret = options['clusterSecret']
+        SCRYPTED_CLUSTER_ADDRESS = os.environ.get('SCRYPTED_CLUSTER_ADDRESS')
 
         def computeClusterObjectHash(o: ClusterObject) -> str:
             m = hashlib.sha256()
-            m.update(bytes(f"{o['id']}{o['port']}{o.get('sourcePort') or ''}{o['proxyId']}{clusterSecret}", 'utf8'))
+            m.update(bytes(f"{o['id']}{o.get('address') or ''}{o['port']}{o.get('sourcePort') or ''}{o['proxyId']}{clusterSecret}", 'utf8'))
             return base64.b64encode(m.digest()).decode('utf-8')
 
         def onProxySerialization(value: Any, proxyId: str, sourcePeerPort: int = None):
@@ -420,8 +422,9 @@ class PluginRemote:
             if not properties.get('__cluster', None):
                 clusterEntry: ClusterObject = {
                     'id': clusterId,
-                    'proxyId': proxyId,
+                    'address': SCRYPTED_CLUSTER_ADDRESS,
                     'port': clusterPort,
+                    'proxyId': proxyId,
                     'sourcePort': sourcePeerPort,
                 }
                 clusterEntry['sha256'] = computeClusterObjectHash(clusterEntry)
@@ -431,16 +434,20 @@ class PluginRemote:
 
         self.peer.onProxySerialization = onProxySerialization
 
-        async def resolveObject(id: str, sourcePeerPort: int):
-            sourcePeer: rpc.RpcPeer = self.peer if not sourcePeerPort else await rpc.maybe_await(clusterPeers.get(sourcePeerPort))
+        async def resolveObject(id: str, sourcePeerAddress: str, sourcePeerPort: int):
+            sourcePeer: rpc.RpcPeer = self.peer if not sourcePeerPort else await rpc.maybe_await(clusterPeers.get(getClusterPeerKey(sourcePeerAddress, sourcePeerPort)))
             if not sourcePeer:
                 return
             return sourcePeer.localProxyMap.get(id, None)
 
-        clusterPeers: Mapping[int, asyncio.Future[rpc.RpcPeer]] = {}
+        clusterPeers: Mapping[str, asyncio.Future[rpc.RpcPeer]] = {}
+        def getClusterPeerKey(address: str, port: int):
+            address = address or '127.0.0.1'
+            return f'{address}:{port}'
 
         async def handleClusterClient(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-            _, clusterPeerPort = writer.get_extra_info('peername')
+            clusterPeerAddress, clusterPeerPort = writer.get_extra_info('peername')
+            clusterPeerKey = getClusterPeerKey(clusterPeerAddress, clusterPeerPort)
             rpcTransport = rpc_reader.RpcStreamTransport(reader, writer)
             peer: rpc.RpcPeer
             peer, peerReadLoop = await rpc_reader.prepare_peer_readloop(self.loop, rpcTransport)
@@ -448,13 +455,13 @@ class PluginRemote:
                 value, proxyId, clusterPeerPort)
             future: asyncio.Future[rpc.RpcPeer] = asyncio.Future()
             future.set_result(peer)
-            clusterPeers[clusterPeerPort] = future
+            clusterPeers[clusterPeerKey] = future
 
             async def connectRPCObject(o: ClusterObject):
                 sha256 = computeClusterObjectHash(o)
                 if sha256 != o['sha256']:
                     raise Exception('secret incorrect')
-                return await resolveObject(o['proxyId'], o.get('sourcePort'))
+                return await resolveObject(o['proxyId'], o.get('address'), o.get('sourcePort'))
 
             peer.params['connectRPCObject'] = connectRPCObject
             try:
@@ -462,19 +469,21 @@ class PluginRemote:
             except:
                 pass
             finally:
-                clusterPeers.pop(clusterPeerPort)
+                clusterPeers.pop(clusterPeerKey)
                 peer.kill('cluster client killed')
                 writer.close()
 
-        clusterRpcServer = await asyncio.start_server(handleClusterClient, '127.0.0.1', 0)
+        listenAddress = '0.0.0.0' if SCRYPTED_CLUSTER_ADDRESS else '127.0.0.1'
+        clusterRpcServer = await asyncio.start_server(handleClusterClient, listenAddress, 0)
         clusterPort = clusterRpcServer.sockets[0].getsockname()[1]
 
-        def ensureClusterPeer(port: int):
-            clusterPeerPromise = clusterPeers.get(port)
+        def ensureClusterPeer(address: str, port: int):
+            clusterPeerKey = getClusterPeerKey(address, port)
+            clusterPeerPromise = clusterPeers.get(clusterPeerKey)
             if not clusterPeerPromise:
                 async def connectClusterPeer():
                     reader, writer = await asyncio.open_connection(
-                        '127.0.0.1', port)
+                        address or '127.0.0.1', port)
                     _, clusterPeerPort = writer.get_extra_info('sockname')
                     rpcTransport = rpc_reader.RpcStreamTransport(
                         reader, writer)
